@@ -356,7 +356,9 @@ class RecorderApp(ctk.CTk):
             print(f"Error opening folder dialog: {e}")
 
     def _on_start(self) -> None:
-        self.btn_start.configure(state="disabled")
+        # Change button color to gray and update text to visually indicate working state
+        self.btn_start.configure(state="disabled", fg_color="gray", text="Starting...")
+        
         self.btn_browse.configure(state="disabled")
         self.option_format.configure(state="disabled")
         self.option_audio.configure(state="disabled")
@@ -371,6 +373,10 @@ class RecorderApp(ctk.CTk):
             self.after(1000, self._countdown_step)
         else:
             self.label_status.configure(text="Recording...")
+            
+            # Further update the start button to reflect it's currently actively recording
+            self.btn_start.configure(text="Recording Active...")
+            
             self.recorder.start(
                 video_format=self.format_var.get(), 
                 audio_source=self.audio_source_var.get()
@@ -408,7 +414,9 @@ class RecorderApp(ctk.CTk):
         self.after(0, self._on_stop_finished)
 
     def _on_stop_finished(self) -> None:
-        self.btn_start.configure(state="normal")
+        # Revert the Start Recording button back to Green and restore its original text
+        self.btn_start.configure(state="normal", fg_color="green", text="Start Recording")
+        
         self.btn_browse.configure(state="normal")
         self.option_format.configure(state="normal")
         self.option_audio.configure(state="normal")
