@@ -316,6 +316,9 @@ class RecorderApp(ctk.CTk):
         self.label_timer = ctk.CTkLabel(self, text="00:00:00", font=ctk.CTkFont(size=20, weight="bold"))
         self.label_timer.grid(row=5, column=0, padx=20, pady=5)
 
+        # Reusable bold font for buttons
+        bold_btn_font = ctk.CTkFont(weight="bold")
+
         # Control Buttons
         self.btn_start = ctk.CTkButton(
             self, text="Start Recording", fg_color="green", hover_color="darkgreen", command=self._on_start
@@ -324,12 +327,14 @@ class RecorderApp(ctk.CTk):
 
         self.btn_pause = ctk.CTkButton(
             self, text="Pause Recording", fg_color="orange", hover_color="darkorange", 
+            text_color="white", font=bold_btn_font,  # Added bold white text
             command=self._on_pause, state="disabled"
         )
         self.btn_pause.grid(row=7, column=0, padx=20, pady=5)
 
         self.btn_stop = ctk.CTkButton(
             self, text="Stop Recording", fg_color="red", hover_color="darkred", 
+            text_color="white", font=bold_btn_font,  # Added bold white text
             command=self._on_stop, state="disabled"
         )
         self.btn_stop.grid(row=8, column=0, padx=20, pady=5)
@@ -381,10 +386,12 @@ class RecorderApp(ctk.CTk):
         if self.recorder.is_paused:
             self.recorder.resume()
             self.last_timer_time = time.time() # Reset to avoid jumping time
+            # The text_color and font properties remain intact automatically
             self.btn_pause.configure(text="Pause Recording", fg_color="orange", hover_color="darkorange")
             self.label_status.configure(text="Recording...")
         else:
             self.recorder.pause()
+            # The text_color and font properties remain intact automatically
             self.btn_pause.configure(text="Resume Recording", fg_color="#1E90FF", hover_color="#1874CD")
             self.label_status.configure(text="Paused")
 
