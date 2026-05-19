@@ -1,8 +1,11 @@
 """
 Screen Recorder Application.
 A user-friendly screen recorder built with customtkinter, OpenCV, and sounddevice.
+Features Fast FFmpeg saving and a Pause/Resume function.
 """
 
+import os
+import subprocess
 import threading
 import time
 import wave
@@ -14,7 +17,7 @@ import customtkinter as ctk
 import cv2
 import numpy as np
 import sounddevice as sd
-from moviepy import VideoFileClip, AudioFileClip
+import imageio_ffmpeg
 from PIL import ImageGrab
 from screeninfo import get_monitors
 
@@ -34,13 +37,11 @@ class ScreenRecorder:
     def __init__(self, output_dir: Path) -> None:
         """
         Initialize the recorder.
-
-        Args:
-            output_dir: The directory where recordings will be saved.
         """
         self.output_dir: Path = output_dir
         self.is_recording: bool = False
         self._stop_event: threading.Event = threading.Event()
+        self._pause_event: threading.Event = threading.Event()
         
         self._video_thread: threading.Thread | None = None
         self._audio_thread: threading.Thread | None = None
@@ -52,17 +53,20 @@ class ScreenRecorder:
         self._temp_video: Path | None = None
         self._temp_mic: Path | None = None
 
-        # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def start(self, video_format: str = "mp4", audio_source: str = "None") -> None:
-        """
-        Start the recording threads.
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_event.is_set()
 
-        Args:
-            video_format: The format of the video file (e.g., 'mp4', 'avi').
-            audio_source: Type of audio to record ('None' or 'Microphone').
-        """
+    def pause(self) -> None:
+        self._pause_event.set()
+
+    def resume(self) -> None:
+        self._pause_event.clear()
+
+    def start(self, video_format: str = "mp4", audio_source: str = "None") -> None:
+        """Start the recording threads."""
         if self.is_recording:
             return
 
@@ -70,6 +74,7 @@ class ScreenRecorder:
         self.video_format = video_format
         self.audio_source = audio_source
         self._stop_event.clear()
+        self._pause_event.clear()
         
         timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_filename = f"recording_{timestamp}.{self.video_format}"
@@ -84,7 +89,7 @@ class ScreenRecorder:
         )
         self._video_thread.start()
 
-        # Start Audio Thread depending on selection
+        # Start Audio Thread
         if self.audio_source == "Microphone":
             self._audio_thread = threading.Thread(
                 target=self._record_audio_loop, args=(self._temp_mic,), daemon=True
@@ -92,11 +97,12 @@ class ScreenRecorder:
             self._audio_thread.start()
 
     def stop(self) -> None:
-        """Stop the recording and merge files."""
+        """Stop the recording and trigger the fast merge."""
         if not self.is_recording:
             return
 
         self.is_recording = False
+        self._pause_event.clear() # Ensure threads aren't stuck sleeping
         self._stop_event.set()
         
         if self._video_thread:
@@ -107,7 +113,7 @@ class ScreenRecorder:
         self._finalize_recording()
 
     def _record_video(self, output_path: Path) -> None:
-        """Video recording loop."""
+        """Video recording loop equipped with Pause support."""
         try:
             monitor = get_monitors()[0]
             bbox = (0, 0, monitor.width, monitor.height)
@@ -119,8 +125,14 @@ class ScreenRecorder:
         frame_duration = 1.0 / FPS
         
         try:
+            next_frame_time = time.time()
             while not self._stop_event.is_set():
-                start_time = time.time()
+                
+                # If Paused, Idle and keep next_frame_time fresh so it doesn't burst frames when unpaused
+                if self._pause_event.is_set():
+                    time.sleep(0.1)
+                    next_frame_time = time.time() 
+                    continue
                 
                 img = ImageGrab.grab(bbox=bbox) if bbox else ImageGrab.grab()
                 frame = np.array(img)
@@ -132,43 +144,41 @@ class ScreenRecorder:
                     
                 out.write(frame)
                 
-                elapsed = time.time() - start_time
-                sleep_time = max(0, frame_duration - elapsed)
+                next_frame_time += frame_duration
+                sleep_time = next_frame_time - time.time()
+                
                 if sleep_time > 0:
                     time.sleep(sleep_time)
+                else:
+                    # Reset if falling slightly behind to prevent catch-up jitter
+                    next_frame_time = time.time()
         finally:
             if out is not None:
                 out.release()
 
     def _record_audio_loop(self, output_path: Path) -> None:
-        """Audio recording loop using a high-performance C callback to prevent speech dropping."""
+        """Audio recording loop equipped with Pause support."""
         audio_data = []
 
         def callback(indata, frames, time_info, status):
-            if status:
-                print(f"Audio Status: {status}")
-            audio_data.append(indata.copy())
+            # Only record the audio chunk if we are not paused
+            if not self._pause_event.is_set():
+                audio_data.append(indata.copy())
 
         try:
-            # We first try to initialize the stream at 48000Hz (Best sync for Video).
-            # If the specific mic doesn't support 48000Hz, we fallback to its default.
-            # Using dtype='int16' captures flawless audio right from the driver.
             try:
                 stream = sd.InputStream(samplerate=48000, dtype='int16', callback=callback)
             except Exception:
                 stream = sd.InputStream(dtype='int16', callback=callback)
 
             with stream:
-                # Capture the actual properties assigned to the mic
                 channels = stream.channels
                 samplerate = int(stream.samplerate)
                 
-                # Keep the thread alive while the background callback collects audio
                 while not self._stop_event.is_set():
                     time.sleep(0.1)
 
             if audio_data:
-                # Concatenate frames and write the WAV file
                 full_audio = np.concatenate(audio_data, axis=0)
                 
                 with wave.open(str(output_path), 'wb') as wf:
@@ -181,33 +191,45 @@ class ScreenRecorder:
             print(f"Error recording audio: {e}")
 
     def _finalize_recording(self) -> None:
-        """Merge audio (if any) and video into the final file."""
+        """Fast FFmpeg merger (Extremely fast, skips python re-encoding entirely)."""
         final_path = self.output_dir / self.current_filename
         
         try:
-            with VideoFileClip(str(self._temp_video)) as video_clip:
-                if self.audio_source == "Microphone" and self._temp_mic and self._temp_mic.exists():
-                    with AudioFileClip(str(self._temp_mic)) as audio_clip:
-                        final_clip = video_clip.with_audio(audio_clip)
-                        final_clip.write_videofile(
-                            str(final_path), 
-                            codec="libx264", 
-                            audio_codec="aac",
-                            audio_bitrate="320k", # 320k bitrate for clear sound
-                            fps=FPS,
-                            logger=None
-                        )
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            cmd = [ffmpeg_exe, "-y"]
+            
+            cmd.extend(["-i", str(self._temp_video)])
+            
+            has_audio = self.audio_source == "Microphone" and self._temp_mic and self._temp_mic.exists()
+            if has_audio:
+                cmd.extend(["-i", str(self._temp_mic)])
+                
+            # For MP4 we encode fast, for AVI we just stream-copy making it instant
+            if self.video_format == "mp4":
+                cmd.extend(["-c:v", "libx264", "-preset", "superfast", "-crf", "23"])
+            else:
+                cmd.extend(["-c:v", "copy"])
+                
+            if has_audio:
+                if self.video_format == "mp4":
+                    cmd.extend(["-c:a", "aac", "-b:a", "320k"])
                 else:
-                    if self.video_format == "mp4":
-                        video_clip.write_videofile(str(final_path), codec="libx264", fps=FPS, logger=None)
-                    else:
-                        video_clip.write_videofile(str(final_path), codec="png", fps=FPS, logger=None)
+                    cmd.extend(["-c:a", "libmp3lame", "-b:a", "320k"])
+                    
+            cmd.append(str(final_path))
+            
+            # Subprocess handles execution cleanly. Hide console on Windows.
+            kwargs = {}
+            if os.name == 'nt':
+                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+                
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, **kwargs)
                         
         except Exception as e:
             print(f"Error during finalization: {e}")
         finally:
-            # Clean up temporary files safely
-            time.sleep(0.5)
+            # Let OS file handles release safely before deleting
+            time.sleep(1.0)
             for temp_file in [self._temp_video, self._temp_mic]:
                 if temp_file is not None and temp_file.exists():
                     try:
@@ -220,12 +242,11 @@ class RecorderApp(ctk.CTk):
     """Main Application GUI."""
 
     def __init__(self) -> None:
-        """Initialize the GUI."""
         super().__init__()
 
-        self.title("Screen_recorder")
-        self.geometry("500x550")
-        self.resizable(False, False) # Disable maximize button
+        self.title("Screen Recorder")
+        self.geometry("500x580")
+        self.resizable(False, False) 
 
         self.output_path_var = ctk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.format_var = ctk.StringVar(value="mp4")
@@ -233,15 +254,17 @@ class RecorderApp(ctk.CTk):
         self.theme_var = ctk.StringVar(value="Dark")
         
         self.recorder: ScreenRecorder = ScreenRecorder(Path(self.output_path_var.get()))
-        self.start_time: float = 0.0
+        
+        # New robust timer variables
+        self.elapsed_time: float = 0.0
+        self.last_timer_time: float = 0.0
 
         self._setup_ui()
         self._apply_theme()
 
     def _setup_ui(self) -> None:
-        """Create and arrange UI components."""
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure((0, 1, 2, 3, 4, 5, 6, 7, 8), weight=1)
+        self.grid_rowconfigure((0, 1, 2, 3, 4, 5, 6, 7, 8, 9), weight=1)
 
         # Header
         self.label_title = ctk.CTkLabel(
@@ -265,7 +288,6 @@ class RecorderApp(ctk.CTk):
         self.frame_options.grid(row=2, column=0, padx=20, pady=5, sticky="ew")
         self.frame_options.grid_columnconfigure((0, 1), weight=1)
 
-        # Format Selection
         self.label_format = ctk.CTkLabel(self.frame_options, text="Format:")
         self.label_format.grid(row=0, column=0, padx=10, pady=5, sticky="w")
         self.option_format = ctk.CTkOptionMenu(
@@ -273,17 +295,13 @@ class RecorderApp(ctk.CTk):
         )
         self.option_format.grid(row=0, column=1, padx=10, pady=5, sticky="e")
 
-        # Audio Selection
         self.label_audio = ctk.CTkLabel(self.frame_options, text="Audio Source:")
         self.label_audio.grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.option_audio = ctk.CTkOptionMenu(
-            self.frame_options, 
-            values=["None", "Microphone"], 
-            variable=self.audio_source_var
+            self.frame_options, values=["None", "Microphone"], variable=self.audio_source_var
         )
         self.option_audio.grid(row=1, column=1, padx=10, pady=5, sticky="e")
 
-        # Theme Toggle
         self.label_theme = ctk.CTkLabel(self.frame_options, text="Theme:")
         self.label_theme.grid(row=2, column=0, padx=10, pady=5, sticky="w")
         self.option_theme = ctk.CTkOptionMenu(
@@ -291,52 +309,46 @@ class RecorderApp(ctk.CTk):
         )
         self.option_theme.grid(row=2, column=1, padx=10, pady=5, sticky="e")
 
-        # Status Label
-        self.label_status = ctk.CTkLabel(
-            self, text="Ready to record",
-            font=ctk.CTkFont(size=14)
-        )
-        self.label_status.grid(row=4, column=0, padx=20, pady=10)
+        # Status & Timer Labels
+        self.label_status = ctk.CTkLabel(self, text="Ready to record", font=ctk.CTkFont(size=14))
+        self.label_status.grid(row=4, column=0, padx=20, pady=5)
 
-        # Timer Label
-        self.label_timer = ctk.CTkLabel(
-            self, text="00:00:00", font=ctk.CTkFont(size=20, weight="bold")
-        )
-        self.label_timer.grid(row=5, column=0, padx=20, pady=10)
+        self.label_timer = ctk.CTkLabel(self, text="00:00:00", font=ctk.CTkFont(size=20, weight="bold"))
+        self.label_timer.grid(row=5, column=0, padx=20, pady=5)
 
         # Control Buttons
         self.btn_start = ctk.CTkButton(
-            self, text="Start Recording", fg_color="green", hover_color="darkgreen",
-            command=self._on_start
+            self, text="Start Recording", fg_color="green", hover_color="darkgreen", command=self._on_start
         )
-        self.btn_start.grid(row=6, column=0, padx=20, pady=10)
+        self.btn_start.grid(row=6, column=0, padx=20, pady=5)
+
+        self.btn_pause = ctk.CTkButton(
+            self, text="Pause Recording", fg_color="orange", hover_color="darkorange", 
+            command=self._on_pause, state="disabled"
+        )
+        self.btn_pause.grid(row=7, column=0, padx=20, pady=5)
 
         self.btn_stop = ctk.CTkButton(
-            self, text="Stop Recording", fg_color="red", hover_color="darkred",
+            self, text="Stop Recording", fg_color="red", hover_color="darkred", 
             command=self._on_stop, state="disabled"
         )
-        self.btn_stop.grid(row=7, column=0, padx=20, pady=10)
+        self.btn_stop.grid(row=8, column=0, padx=20, pady=5)
 
     def _apply_theme(self, theme: str | None = None) -> None:
-        """Apply selected theme."""
         ctk.set_appearance_mode(self.theme_var.get())
 
     def _on_choose_folder(self) -> None:
-        """Open folder dialog to select output directory safely."""
         from tkinter import filedialog
         try:
-            # Anchoring 'parent=self' forces the dialog to tie correctly to the CustomTkinter frame, stopping freezes/crashes
             folder_selected = filedialog.askdirectory(parent=self, title="Select Output Folder")
             if folder_selected:
                 self.output_path_var.set(folder_selected)
                 self.recorder.output_dir = Path(folder_selected)
                 self.recorder.output_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            # Prevents crashing the app silently if the window OS dialogue throws an error
             print(f"Error opening folder dialog: {e}")
 
     def _on_start(self) -> None:
-        """Handle start button click."""
         self.btn_start.configure(state="disabled")
         self.btn_browse.configure(state="disabled")
         self.option_format.configure(state="disabled")
@@ -346,7 +358,6 @@ class RecorderApp(ctk.CTk):
         self._countdown_step()
 
     def _countdown_step(self) -> None:
-        """Non-blocking countdown before the recording starts."""
         if self.countdown > 0:
             self.label_status.configure(text=f"Starting in {self.countdown}...")
             self.countdown -= 1
@@ -357,26 +368,39 @@ class RecorderApp(ctk.CTk):
                 video_format=self.format_var.get(), 
                 audio_source=self.audio_source_var.get()
             )
-            self.start_time = time.time()
+            
+            # Reset UI timer variables
+            self.elapsed_time = 0.0
+            self.last_timer_time = time.time()
+            
             self.btn_stop.configure(state="normal")
+            self.btn_pause.configure(state="normal", text="Pause Recording", fg_color="orange")
             self._update_timer()
 
+    def _on_pause(self) -> None:
+        if self.recorder.is_paused:
+            self.recorder.resume()
+            self.last_timer_time = time.time() # Reset to avoid jumping time
+            self.btn_pause.configure(text="Pause Recording", fg_color="orange", hover_color="darkorange")
+            self.label_status.configure(text="Recording...")
+        else:
+            self.recorder.pause()
+            self.btn_pause.configure(text="Resume Recording", fg_color="#1E90FF", hover_color="#1874CD")
+            self.label_status.configure(text="Paused")
+
     def _on_stop(self) -> None:
-        """Handle stop button click."""
-        self.label_status.configure(text="Saving and merging... please wait.")
+        self.label_status.configure(text="Saving fast... please wait.")
         self.btn_stop.configure(state="disabled")
+        self.btn_pause.configure(state="disabled")
         self.update()
         
-        # Run saving logic in a background thread to prevent GUI freeze
         threading.Thread(target=self._stop_recording_thread, daemon=True).start()
 
     def _stop_recording_thread(self) -> None:
-        """Run recorder stop functionality in the background."""
         self.recorder.stop()
         self.after(0, self._on_stop_finished)
 
     def _on_stop_finished(self) -> None:
-        """Re-enable elements once merging completely finishes."""
         self.btn_start.configure(state="normal")
         self.btn_browse.configure(state="normal")
         self.option_format.configure(state="normal")
@@ -386,13 +410,22 @@ class RecorderApp(ctk.CTk):
         )
 
     def _update_timer(self) -> None:
-        """Update the duration timer on the GUI."""
-        if self.recorder.is_recording:
-            elapsed: float = time.time() - self.start_time
-            hours, rem = divmod(int(elapsed), 3600)
-            minutes, seconds = divmod(rem, 60)
-            self.label_timer.configure(text=f"{hours:02}:{minutes:02}:{seconds:02}")
-            self.after(1000, self._update_timer)
+        if not self.recorder.is_recording:
+            return
+            
+        now = time.time()
+        delta = now - self.last_timer_time
+        self.last_timer_time = now
+        
+        # Only increment actual elapsed seconds if not paused
+        if not self.recorder.is_paused:
+            self.elapsed_time += delta
+            
+        hours, rem = divmod(int(self.elapsed_time), 3600)
+        minutes, seconds = divmod(rem, 60)
+        self.label_timer.configure(text=f"{hours:02}:{minutes:02}:{seconds:02}")
+        
+        self.after(500, self._update_timer)
 
 
 if __name__ == "__main__":
