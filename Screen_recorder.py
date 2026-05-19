@@ -1,6 +1,6 @@
 """
 Screen Recorder Application.
-A user-friendly screen recorder built with customtkinter, OpenCV, and SoundDevice.
+A user-friendly screen recorder built with customtkinter, OpenCV, and soundcard.
 """
 
 import threading
@@ -13,8 +13,8 @@ from typing import Final
 import customtkinter as ctk
 import cv2
 import numpy as np
-import sounddevice as sd
-from moviepy import VideoFileClip, AudioFileClip
+import soundcard as sc
+from moviepy import VideoFileClip, AudioFileClip, CompositeAudioClip
 from PIL import ImageGrab
 from screeninfo import get_monitors
 
@@ -22,7 +22,6 @@ from screeninfo import get_monitors
 DEFAULT_OUTPUT_DIR: Final[Path] = Path.home() / "Videos" / "ScreenRecordings"
 FPS: Final[int] = 20
 SAMPLE_RATE: Final[int] = 44100
-CHANNELS: Final[int] = 2
 
 FORMATS: Final[dict[str, str]] = {
     "mp4": "mp4v",
@@ -44,28 +43,33 @@ class ScreenRecorder:
         self.is_recording: bool = False
         self._stop_event: threading.Event = threading.Event()
         self._video_thread: threading.Thread | None = None
-        self._audio_thread: threading.Thread | None = None
+        self._audio_threads: list[threading.Thread] = []
+        
         self.current_filename: str | None = None
         self.video_format: str = "mp4"
-        self.record_audio: bool = False
+        self.audio_source: str = "None"
+        
+        self._temp_video: Path | None = None
+        self._temp_mic: Path | None = None
+        self._temp_sys: Path | None = None
 
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def start(self, video_format: str = "mp4", record_audio: bool = False) -> None:
+    def start(self, video_format: str = "mp4", audio_source: str = "None") -> None:
         """
         Start the recording threads.
 
         Args:
             video_format: The format of the video file (e.g., 'mp4', 'avi').
-            record_audio: Whether to record audio.
+            audio_source: Type of audio to record ('None', 'Microphone', 'System Audio', 'Mic + System').
         """
         if self.is_recording:
             return
 
         self.is_recording = True
         self.video_format = video_format
-        self.record_audio = record_audio
+        self.audio_source = audio_source
         self._stop_event.clear()
         
         timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -73,18 +77,30 @@ class ScreenRecorder:
         
         # Temporary files for merging
         self._temp_video = self.output_dir / f"temp_video_{timestamp}.avi"
-        self._temp_audio = self.output_dir / f"temp_audio_{timestamp}.wav"
+        self._temp_mic = self.output_dir / f"temp_mic_{timestamp}.wav"
+        self._temp_sys = self.output_dir / f"temp_sys_{timestamp}.wav"
+        self._audio_threads = []
 
+        # Start Video Thread
         self._video_thread = threading.Thread(
             target=self._record_video, args=(self._temp_video,), daemon=True
         )
         self._video_thread.start()
 
-        if self.record_audio:
-            self._audio_thread = threading.Thread(
-                target=self._record_audio_loop, args=(self._temp_audio,), daemon=True
+        # Start Audio Thread(s) depending on selection
+        if self.audio_source in ["Microphone", "Mic + System"]:
+            t_mic = threading.Thread(
+                target=self._record_audio_loop, args=(self._temp_mic, "mic"), daemon=True
             )
-            self._audio_thread.start()
+            self._audio_threads.append(t_mic)
+            t_mic.start()
+            
+        if self.audio_source in ["System Audio", "Mic + System"]:
+            t_sys = threading.Thread(
+                target=self._record_audio_loop, args=(self._temp_sys, "sys"), daemon=True
+            )
+            self._audio_threads.append(t_sys)
+            t_sys.start()
 
     def stop(self) -> None:
         """Stop the recording and merge files."""
@@ -96,8 +112,8 @@ class ScreenRecorder:
         
         if self._video_thread:
             self._video_thread.join()
-        if self._audio_thread:
-            self._audio_thread.join()
+        for t in self._audio_threads:
+            t.join()
 
         self._finalize_recording()
 
@@ -138,72 +154,100 @@ class ScreenRecorder:
             if out is not None:
                 out.release()
 
-    def _record_audio_loop(self, output_path: Path) -> None:
-        """Audio recording loop."""
-        audio_data = []
-
-        def callback(indata, frames, time, status):
-            if status:
-                print(status)
-            audio_data.append(indata.copy())
-
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, callback=callback):
-            while not self._stop_event.is_set():
-                time.sleep(0.1)
-
-        if audio_data:
-            full_audio = np.concatenate(audio_data, axis=0)
-            with wave.open(str(output_path), 'wb') as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(2) # 16-bit
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes((full_audio * 32767).astype(np.int16).tobytes())
+    def _record_audio_loop(self, output_path: Path, audio_type: str) -> None:
+        """Audio recording loop supporting both Microphone and System Loopback."""
+        try:
+            if audio_type == "sys":
+                # Find the default speaker and grab its loopback stream
+                speaker = sc.default_speaker()
+                mic = sc.get_microphone(id=str(speaker.id), include_loopback=True)
+            else:
+                # Grab standard default microphone
+                mic = sc.default_microphone()
+                
+            audio_data = []
+            
+            # Soundcard records in float32 format
+            with mic.recorder(samplerate=SAMPLE_RATE) as recorder:
+                while not self._stop_event.is_set():
+                    # Record in 0.1-second chunks
+                    data = recorder.record(numframes=SAMPLE_RATE // 10)
+                    audio_data.append(data)
+                    
+            if audio_data:
+                full_audio = np.concatenate(audio_data, axis=0)
+                
+                # Ensure 2D array (samples, channels)
+                if len(full_audio.shape) == 1:
+                    full_audio = np.expand_dims(full_audio, axis=1)
+                    
+                actual_channels = full_audio.shape[1]
+                
+                # Convert from Float32 to Int16 for standard WAV format
+                full_audio = np.clip(full_audio, -1.0, 1.0)
+                full_audio = (full_audio * 32767).astype(np.int16)
+                
+                with wave.open(str(output_path), 'wb') as wf:
+                    wf.setnchannels(actual_channels)
+                    wf.setsampwidth(2) # 16-bit
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(full_audio.tobytes())
+                    
+        except Exception as e:
+            print(f"Error recording {audio_type} audio: {e}")
 
     def _finalize_recording(self) -> None:
-        """Merge audio and video into the final file."""
+        """Merge audio (mic/sys) and video into the final file."""
         final_path = self.output_dir / self.current_filename
         
         try:
             with VideoFileClip(str(self._temp_video)) as video_clip:
-                if self.record_audio and self._temp_audio.exists():
-                    with AudioFileClip(str(self._temp_audio)) as audio_clip:
-                        final_clip = video_clip.with_audio(audio_clip)
-                        final_clip.write_videofile(
-                            str(final_path), 
-                            codec="libx264", 
-                            audio_codec="aac", 
-                            logger=None
-                        )
-                else:
-                    if self.video_format == "mp4":
-                        video_clip.write_videofile(
-                            str(final_path), 
-                            codec="libx264", 
-                            logger=None
-                        )
+                audio_clips = []
+                
+                # Check for recorded audio tracks
+                if self.audio_source in ["Microphone", "Mic + System"] and self._temp_mic and self._temp_mic.exists():
+                    audio_clips.append(AudioFileClip(str(self._temp_mic)))
+                    
+                if self.audio_source in ["System Audio", "Mic + System"] and self._temp_sys and self._temp_sys.exists():
+                    audio_clips.append(AudioFileClip(str(self._temp_sys)))
+                
+                # Mix and Attach Audio
+                if audio_clips:
+                    if len(audio_clips) > 1:
+                        final_audio = CompositeAudioClip(audio_clips)
                     else:
-                        # For AVI, if no audio, we can just rename/move if it's already XVID
-                        # But to be safe and ensure format consistency, let's write it
-                        video_clip.write_videofile(
-                            str(final_path), 
-                            codec="png", # High quality for AVI
-                            logger=None
-                        )
+                        final_audio = audio_clips[0]
+                        
+                    final_clip = video_clip.with_audio(final_audio)
+                    final_clip.write_videofile(
+                        str(final_path), 
+                        codec="libx264", 
+                        audio_codec="aac", 
+                        logger=None
+                    )
+                    
+                    for ac in audio_clips:
+                        ac.close()
+                    if len(audio_clips) > 1:
+                        final_audio.close()
+                else:
+                    # Write Video Only
+                    if self.video_format == "mp4":
+                        video_clip.write_videofile(str(final_path), codec="libx264", logger=None)
+                    else:
+                        video_clip.write_videofile(str(final_path), codec="png", logger=None)
+                        
         except Exception as e:
             print(f"Error during finalization: {e}")
         finally:
-            # Give OS a moment to release handles
+            # Clean up all temporary files safely
             time.sleep(0.5)
-            if self._temp_video.exists():
-                try:
-                    self._temp_video.unlink()
-                except Exception as e:
-                    print(f"Could not delete temp video: {e}")
-            if self._temp_audio.exists():
-                try:
-                    self._temp_audio.unlink()
-                except Exception as e:
-                    print(f"Could not delete temp audio: {e}")
+            for temp_file in [self._temp_video, self._temp_mic, self._temp_sys]:
+                if temp_file is not None and temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception as e:
+                        print(f"Could not delete temp file {temp_file.name}: {e}")
 
 
 class RecorderApp(ctk.CTk):
@@ -219,7 +263,7 @@ class RecorderApp(ctk.CTk):
 
         self.output_path_var = ctk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.format_var = ctk.StringVar(value="mp4")
-        self.audio_var = ctk.BooleanVar(value=False)
+        self.audio_source_var = ctk.StringVar(value="System Audio")
         self.theme_var = ctk.StringVar(value="Dark")
         
         self.recorder: ScreenRecorder = ScreenRecorder(Path(self.output_path_var.get()))
@@ -263,9 +307,15 @@ class RecorderApp(ctk.CTk):
         )
         self.option_format.grid(row=0, column=1, padx=10, pady=5, sticky="e")
 
-        # Audio Toggle
-        self.check_audio = ctk.CTkCheckBox(self.frame_options, text="Record Audio", variable=self.audio_var)
-        self.check_audio.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky="w")
+        # Audio Selection
+        self.label_audio = ctk.CTkLabel(self.frame_options, text="Audio Source:")
+        self.label_audio.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.option_audio = ctk.CTkOptionMenu(
+            self.frame_options, 
+            values=["None", "Microphone", "System Audio", "Mic + System"], 
+            variable=self.audio_source_var
+        )
+        self.option_audio.grid(row=1, column=1, padx=10, pady=5, sticky="e")
 
         # Theme Toggle
         self.label_theme = ctk.CTkLabel(self.frame_options, text="Theme:")
@@ -318,7 +368,7 @@ class RecorderApp(ctk.CTk):
         self.btn_start.configure(state="disabled")
         self.btn_browse.configure(state="disabled")
         self.option_format.configure(state="disabled")
-        self.check_audio.configure(state="disabled")
+        self.option_audio.configure(state="disabled")
         
         self.countdown = 3
         self._countdown_step()
@@ -328,10 +378,13 @@ class RecorderApp(ctk.CTk):
         if self.countdown > 0:
             self.label_status.configure(text=f"Starting in {self.countdown}...")
             self.countdown -= 1
-            self.after(1000, self._countdown_step) # Use .after() instead of time.sleep()
+            self.after(1000, self._countdown_step)
         else:
             self.label_status.configure(text="Recording...")
-            self.recorder.start(video_format=self.format_var.get(), record_audio=self.audio_var.get())
+            self.recorder.start(
+                video_format=self.format_var.get(), 
+                audio_source=self.audio_source_var.get()
+            )
             self.start_time = time.time()
             self.btn_stop.configure(state="normal")
             self._update_timer()
@@ -355,7 +408,7 @@ class RecorderApp(ctk.CTk):
         self.btn_start.configure(state="normal")
         self.btn_browse.configure(state="normal")
         self.option_format.configure(state="normal")
-        self.check_audio.configure(state="normal")
+        self.option_audio.configure(state="normal")
         self.label_status.configure(
             text=f"Saved: {self.recorder.current_filename}"
         )
