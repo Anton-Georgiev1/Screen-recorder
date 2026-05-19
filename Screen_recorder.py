@@ -6,6 +6,7 @@ A user-friendly screen recorder built with customtkinter, OpenCV, and soundcard.
 import threading
 import time
 import wave
+import tkinter.filedialog as fd
 from datetime import datetime
 from pathlib import Path
 from typing import Final
@@ -21,7 +22,7 @@ from screeninfo import get_monitors
 # Constants
 DEFAULT_OUTPUT_DIR: Final[Path] = Path.home() / "Videos" / "ScreenRecordings"
 FPS: Final[int] = 20
-SAMPLE_RATE: Final[int] = 44100
+SAMPLE_RATE: Final[int] = 48000  # 48000 is the standard for system/video audio
 
 FORMATS: Final[dict[str, str]] = {
     "mp4": "mp4v",
@@ -111,9 +112,11 @@ class ScreenRecorder:
         self._stop_event.set()
         
         if self._video_thread:
-            self._video_thread.join()
+            self._video_thread.join(timeout=2.0)
+        
+        # Using a timeout to prevent absolute deadlock if WASAPI blocks during complete silence
         for t in self._audio_threads:
-            t.join()
+            t.join(timeout=2.0)
 
         self._finalize_recording()
 
@@ -125,7 +128,6 @@ class ScreenRecorder:
         except Exception:
             bbox = None
         
-        # Always use AVI for temp video to ensure compatibility with OpenCV before merging
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
         out = None
         frame_duration = 1.0 / FPS
@@ -138,15 +140,12 @@ class ScreenRecorder:
                 frame = np.array(img)
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 
-                # Wait to initialize VideoWriter until we know the EXACT frame size 
-                # (Prevents silent OpenCV failures on displays with DPI scaling > 100%)
                 if out is None:
                     height, width, _ = frame.shape
                     out = cv2.VideoWriter(str(output_path), fourcc, FPS, (width, height))
                     
                 out.write(frame)
                 
-                # Precise sleep to maintain 1.0x speed
                 elapsed = time.time() - start_time
                 sleep_time = max(0, frame_duration - elapsed)
                 time.sleep(sleep_time)
@@ -158,33 +157,29 @@ class ScreenRecorder:
         """Audio recording loop supporting both Microphone and System Loopback."""
         try:
             if audio_type == "sys":
-                # Find the default speaker and grab its loopback stream
                 speaker = sc.default_speaker()
                 mic = sc.get_microphone(id=str(speaker.id), include_loopback=True)
             else:
-                # Grab standard default microphone
                 mic = sc.default_microphone()
                 
             audio_data = []
             
-            # Soundcard records in float32 format
             with mic.recorder(samplerate=SAMPLE_RATE) as recorder:
                 while not self._stop_event.is_set():
-                    # Record in 0.1-second chunks
-                    data = recorder.record(numframes=SAMPLE_RATE // 10)
+                    # Record in 4096 frame chunks (prevents dropping frames & stabilizes execution)
+                    data = recorder.record(numframes=4096)
                     audio_data.append(data)
                     
             if audio_data:
                 full_audio = np.concatenate(audio_data, axis=0)
                 
-                # Ensure 2D array (samples, channels)
                 if len(full_audio.shape) == 1:
                     full_audio = np.expand_dims(full_audio, axis=1)
                     
                 actual_channels = full_audio.shape[1]
                 
-                # Convert from Float32 to Int16 for standard WAV format
-                full_audio = np.clip(full_audio, -1.0, 1.0)
+                # Strict hard limit to strictly avoid integer wrap-around (which sounds like heavy static/crackling)
+                full_audio = np.clip(full_audio, -0.99, 0.99)
                 full_audio = (full_audio * 32767).astype(np.int16)
                 
                 with wave.open(str(output_path), 'wb') as wf:
@@ -204,14 +199,12 @@ class ScreenRecorder:
             with VideoFileClip(str(self._temp_video)) as video_clip:
                 audio_clips = []
                 
-                # Check for recorded audio tracks
                 if self.audio_source in ["Microphone", "Mic + System"] and self._temp_mic and self._temp_mic.exists():
                     audio_clips.append(AudioFileClip(str(self._temp_mic)))
                     
                 if self.audio_source in ["System Audio", "Mic + System"] and self._temp_sys and self._temp_sys.exists():
                     audio_clips.append(AudioFileClip(str(self._temp_sys)))
                 
-                # Mix and Attach Audio
                 if audio_clips:
                     if len(audio_clips) > 1:
                         final_audio = CompositeAudioClip(audio_clips)
@@ -222,7 +215,9 @@ class ScreenRecorder:
                     final_clip.write_videofile(
                         str(final_path), 
                         codec="libx264", 
-                        audio_codec="aac", 
+                        audio_codec="aac",
+                        audio_bitrate="320k", # 320k bitrate for clear sound
+                        fps=FPS,              # Ensure FPS is carried correctly
                         logger=None
                     )
                     
@@ -231,16 +226,14 @@ class ScreenRecorder:
                     if len(audio_clips) > 1:
                         final_audio.close()
                 else:
-                    # Write Video Only
                     if self.video_format == "mp4":
-                        video_clip.write_videofile(str(final_path), codec="libx264", logger=None)
+                        video_clip.write_videofile(str(final_path), codec="libx264", fps=FPS, logger=None)
                     else:
-                        video_clip.write_videofile(str(final_path), codec="png", logger=None)
+                        video_clip.write_videofile(str(final_path), codec="png", fps=FPS, logger=None)
                         
         except Exception as e:
             print(f"Error during finalization: {e}")
         finally:
-            # Clean up all temporary files safely
             time.sleep(0.5)
             for temp_file in [self._temp_video, self._temp_mic, self._temp_sys]:
                 if temp_file is not None and temp_file.exists():
@@ -357,7 +350,8 @@ class RecorderApp(ctk.CTk):
 
     def _on_choose_folder(self) -> None:
         """Open folder dialog to select output directory."""
-        folder_selected = ctk.filedialog.askdirectory()
+        # Fix: using standard tkinter filedialog handles path extraction safely and prevents UI crashes
+        folder_selected = fd.askdirectory()
         if folder_selected:
             self.output_path_var.set(folder_selected)
             self.recorder.output_dir = Path(folder_selected)
