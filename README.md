@@ -52,7 +52,7 @@ Ensure you have Python 3.12+ installed.
     ```
 
 > [!NOTE] 
-> On Linux, you might need to install `portaudio` for `sounddevice` to work.*
+> On Linux, you might need to install `portaudio` for `sounddevice` to work.
 
 ---
 
