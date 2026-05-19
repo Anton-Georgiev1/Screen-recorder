@@ -51,7 +51,8 @@ Ensure you have Python 3.12+ installed.
     pip install -r requirements.txt
     ```
 
-    *Note: On Linux, you might need to install `portaudio` for `sounddevice` to work.*
+> [!NOTE] 
+> On Linux, you might need to install `portaudio` for `sounddevice` to work.*
 
 ---
 
