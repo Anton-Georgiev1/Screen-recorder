@@ -22,7 +22,7 @@ from PIL import ImageGrab
 from screeninfo import get_monitors
 
 # Constants
-DEFAULT_OUTPUT_DIR: Final[Path] = Path.home() / "Videos" / "ScreenRecordings"
+DEFAULT_OUTPUT_DIR: Final[Path] = Path.home() / "Desktop"
 FPS: Final[int] = 20
 
 FORMATS: Final[dict[str, str]] = {
