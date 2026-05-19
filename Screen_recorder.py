@@ -1,12 +1,11 @@
 """
 Screen Recorder Application.
-A user-friendly screen recorder built with customtkinter, OpenCV, and soundcard.
+A user-friendly screen recorder built with customtkinter, OpenCV, and sounddevice.
 """
 
 import threading
 import time
 import wave
-import tkinter.filedialog as fd
 from datetime import datetime
 from pathlib import Path
 from typing import Final
@@ -14,15 +13,14 @@ from typing import Final
 import customtkinter as ctk
 import cv2
 import numpy as np
-import soundcard as sc
-from moviepy import VideoFileClip, AudioFileClip, CompositeAudioClip
+import sounddevice as sd
+from moviepy import VideoFileClip, AudioFileClip
 from PIL import ImageGrab
 from screeninfo import get_monitors
 
 # Constants
 DEFAULT_OUTPUT_DIR: Final[Path] = Path.home() / "Videos" / "ScreenRecordings"
 FPS: Final[int] = 20
-SAMPLE_RATE: Final[int] = 48000  # 48000 is the standard for system/video audio
 
 FORMATS: Final[dict[str, str]] = {
     "mp4": "mp4v",
@@ -43,8 +41,9 @@ class ScreenRecorder:
         self.output_dir: Path = output_dir
         self.is_recording: bool = False
         self._stop_event: threading.Event = threading.Event()
+        
         self._video_thread: threading.Thread | None = None
-        self._audio_threads: list[threading.Thread] = []
+        self._audio_thread: threading.Thread | None = None
         
         self.current_filename: str | None = None
         self.video_format: str = "mp4"
@@ -52,7 +51,6 @@ class ScreenRecorder:
         
         self._temp_video: Path | None = None
         self._temp_mic: Path | None = None
-        self._temp_sys: Path | None = None
 
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -63,7 +61,7 @@ class ScreenRecorder:
 
         Args:
             video_format: The format of the video file (e.g., 'mp4', 'avi').
-            audio_source: Type of audio to record ('None', 'Microphone', 'System Audio', 'Mic + System').
+            audio_source: Type of audio to record ('None' or 'Microphone').
         """
         if self.is_recording:
             return
@@ -79,8 +77,6 @@ class ScreenRecorder:
         # Temporary files for merging
         self._temp_video = self.output_dir / f"temp_video_{timestamp}.avi"
         self._temp_mic = self.output_dir / f"temp_mic_{timestamp}.wav"
-        self._temp_sys = self.output_dir / f"temp_sys_{timestamp}.wav"
-        self._audio_threads = []
 
         # Start Video Thread
         self._video_thread = threading.Thread(
@@ -88,20 +84,12 @@ class ScreenRecorder:
         )
         self._video_thread.start()
 
-        # Start Audio Thread(s) depending on selection
-        if self.audio_source in ["Microphone", "Mic + System"]:
-            t_mic = threading.Thread(
-                target=self._record_audio_loop, args=(self._temp_mic, "mic"), daemon=True
+        # Start Audio Thread depending on selection
+        if self.audio_source == "Microphone":
+            self._audio_thread = threading.Thread(
+                target=self._record_audio_loop, args=(self._temp_mic,), daemon=True
             )
-            self._audio_threads.append(t_mic)
-            t_mic.start()
-            
-        if self.audio_source in ["System Audio", "Mic + System"]:
-            t_sys = threading.Thread(
-                target=self._record_audio_loop, args=(self._temp_sys, "sys"), daemon=True
-            )
-            self._audio_threads.append(t_sys)
-            t_sys.start()
+            self._audio_thread.start()
 
     def stop(self) -> None:
         """Stop the recording and merge files."""
@@ -113,10 +101,8 @@ class ScreenRecorder:
         
         if self._video_thread:
             self._video_thread.join(timeout=2.0)
-        
-        # Using a timeout to prevent absolute deadlock if WASAPI blocks during complete silence
-        for t in self._audio_threads:
-            t.join(timeout=2.0)
+        if self._audio_thread:
+            self._audio_thread.join(timeout=2.0)
 
         self._finalize_recording()
 
@@ -148,83 +134,69 @@ class ScreenRecorder:
                 
                 elapsed = time.time() - start_time
                 sleep_time = max(0, frame_duration - elapsed)
-                time.sleep(sleep_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
         finally:
             if out is not None:
                 out.release()
 
-    def _record_audio_loop(self, output_path: Path, audio_type: str) -> None:
-        """Audio recording loop supporting both Microphone and System Loopback."""
+    def _record_audio_loop(self, output_path: Path) -> None:
+        """Audio recording loop using a high-performance C callback to prevent speech dropping."""
+        audio_data = []
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                print(f"Audio Status: {status}")
+            audio_data.append(indata.copy())
+
         try:
-            if audio_type == "sys":
-                speaker = sc.default_speaker()
-                mic = sc.get_microphone(id=str(speaker.id), include_loopback=True)
-            else:
-                mic = sc.default_microphone()
+            # We first try to initialize the stream at 48000Hz (Best sync for Video).
+            # If the specific mic doesn't support 48000Hz, we fallback to its default.
+            # Using dtype='int16' captures flawless audio right from the driver.
+            try:
+                stream = sd.InputStream(samplerate=48000, dtype='int16', callback=callback)
+            except Exception:
+                stream = sd.InputStream(dtype='int16', callback=callback)
+
+            with stream:
+                # Capture the actual properties assigned to the mic
+                channels = stream.channels
+                samplerate = int(stream.samplerate)
                 
-            audio_data = []
-            
-            with mic.recorder(samplerate=SAMPLE_RATE) as recorder:
+                # Keep the thread alive while the background callback collects audio
                 while not self._stop_event.is_set():
-                    # Record in 4096 frame chunks (prevents dropping frames & stabilizes execution)
-                    data = recorder.record(numframes=4096)
-                    audio_data.append(data)
-                    
+                    time.sleep(0.1)
+
             if audio_data:
+                # Concatenate frames and write the WAV file
                 full_audio = np.concatenate(audio_data, axis=0)
                 
-                if len(full_audio.shape) == 1:
-                    full_audio = np.expand_dims(full_audio, axis=1)
-                    
-                actual_channels = full_audio.shape[1]
-                
-                # Strict hard limit to strictly avoid integer wrap-around (which sounds like heavy static/crackling)
-                full_audio = np.clip(full_audio, -0.99, 0.99)
-                full_audio = (full_audio * 32767).astype(np.int16)
-                
                 with wave.open(str(output_path), 'wb') as wf:
-                    wf.setnchannels(actual_channels)
+                    wf.setnchannels(channels)
                     wf.setsampwidth(2) # 16-bit
-                    wf.setframerate(SAMPLE_RATE)
+                    wf.setframerate(samplerate)
                     wf.writeframes(full_audio.tobytes())
                     
         except Exception as e:
-            print(f"Error recording {audio_type} audio: {e}")
+            print(f"Error recording audio: {e}")
 
     def _finalize_recording(self) -> None:
-        """Merge audio (mic/sys) and video into the final file."""
+        """Merge audio (if any) and video into the final file."""
         final_path = self.output_dir / self.current_filename
         
         try:
             with VideoFileClip(str(self._temp_video)) as video_clip:
-                audio_clips = []
-                
-                if self.audio_source in ["Microphone", "Mic + System"] and self._temp_mic and self._temp_mic.exists():
-                    audio_clips.append(AudioFileClip(str(self._temp_mic)))
-                    
-                if self.audio_source in ["System Audio", "Mic + System"] and self._temp_sys and self._temp_sys.exists():
-                    audio_clips.append(AudioFileClip(str(self._temp_sys)))
-                
-                if audio_clips:
-                    if len(audio_clips) > 1:
-                        final_audio = CompositeAudioClip(audio_clips)
-                    else:
-                        final_audio = audio_clips[0]
-                        
-                    final_clip = video_clip.with_audio(final_audio)
-                    final_clip.write_videofile(
-                        str(final_path), 
-                        codec="libx264", 
-                        audio_codec="aac",
-                        audio_bitrate="320k", # 320k bitrate for clear sound
-                        fps=FPS,              # Ensure FPS is carried correctly
-                        logger=None
-                    )
-                    
-                    for ac in audio_clips:
-                        ac.close()
-                    if len(audio_clips) > 1:
-                        final_audio.close()
+                if self.audio_source == "Microphone" and self._temp_mic and self._temp_mic.exists():
+                    with AudioFileClip(str(self._temp_mic)) as audio_clip:
+                        final_clip = video_clip.with_audio(audio_clip)
+                        final_clip.write_videofile(
+                            str(final_path), 
+                            codec="libx264", 
+                            audio_codec="aac",
+                            audio_bitrate="320k", # 320k bitrate for clear sound
+                            fps=FPS,
+                            logger=None
+                        )
                 else:
                     if self.video_format == "mp4":
                         video_clip.write_videofile(str(final_path), codec="libx264", fps=FPS, logger=None)
@@ -234,8 +206,9 @@ class ScreenRecorder:
         except Exception as e:
             print(f"Error during finalization: {e}")
         finally:
+            # Clean up temporary files safely
             time.sleep(0.5)
-            for temp_file in [self._temp_video, self._temp_mic, self._temp_sys]:
+            for temp_file in [self._temp_video, self._temp_mic]:
                 if temp_file is not None and temp_file.exists():
                     try:
                         temp_file.unlink()
@@ -256,7 +229,7 @@ class RecorderApp(ctk.CTk):
 
         self.output_path_var = ctk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         self.format_var = ctk.StringVar(value="mp4")
-        self.audio_source_var = ctk.StringVar(value="System Audio")
+        self.audio_source_var = ctk.StringVar(value="Microphone")
         self.theme_var = ctk.StringVar(value="Dark")
         
         self.recorder: ScreenRecorder = ScreenRecorder(Path(self.output_path_var.get()))
@@ -305,7 +278,7 @@ class RecorderApp(ctk.CTk):
         self.label_audio.grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.option_audio = ctk.CTkOptionMenu(
             self.frame_options, 
-            values=["None", "Microphone", "System Audio", "Mic + System"], 
+            values=["None", "Microphone"], 
             variable=self.audio_source_var
         )
         self.option_audio.grid(row=1, column=1, padx=10, pady=5, sticky="e")
@@ -349,13 +322,18 @@ class RecorderApp(ctk.CTk):
         ctk.set_appearance_mode(self.theme_var.get())
 
     def _on_choose_folder(self) -> None:
-        """Open folder dialog to select output directory."""
-        # Fix: using standard tkinter filedialog handles path extraction safely and prevents UI crashes
-        folder_selected = fd.askdirectory()
-        if folder_selected:
-            self.output_path_var.set(folder_selected)
-            self.recorder.output_dir = Path(folder_selected)
-            self.recorder.output_dir.mkdir(parents=True, exist_ok=True)
+        """Open folder dialog to select output directory safely."""
+        from tkinter import filedialog
+        try:
+            # Anchoring 'parent=self' forces the dialog to tie correctly to the CustomTkinter frame, stopping freezes/crashes
+            folder_selected = filedialog.askdirectory(parent=self, title="Select Output Folder")
+            if folder_selected:
+                self.output_path_var.set(folder_selected)
+                self.recorder.output_dir = Path(folder_selected)
+                self.recorder.output_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            # Prevents crashing the app silently if the window OS dialogue throws an error
+            print(f"Error opening folder dialog: {e}")
 
     def _on_start(self) -> None:
         """Handle start button click."""
