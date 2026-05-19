@@ -103,22 +103,31 @@ class ScreenRecorder:
 
     def _record_video(self, output_path: Path) -> None:
         """Video recording loop."""
-        monitor = get_monitors()[0]
-        screen_size: tuple[int, int] = (monitor.width, monitor.height)
+        try:
+            monitor = get_monitors()[0]
+            bbox = (0, 0, monitor.width, monitor.height)
+        except Exception:
+            bbox = None
         
         # Always use AVI for temp video to ensure compatibility with OpenCV before merging
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        out = cv2.VideoWriter(str(output_path), fourcc, FPS, screen_size)
-
+        out = None
         frame_duration = 1.0 / FPS
         
         try:
             while not self._stop_event.is_set():
                 start_time = time.time()
                 
-                img = ImageGrab.grab(bbox=(0, 0, screen_size[0], screen_size[1]))
+                img = ImageGrab.grab(bbox=bbox) if bbox else ImageGrab.grab()
                 frame = np.array(img)
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                
+                # Wait to initialize VideoWriter until we know the EXACT frame size 
+                # (Prevents silent OpenCV failures on displays with DPI scaling > 100%)
+                if out is None:
+                    height, width, _ = frame.shape
+                    out = cv2.VideoWriter(str(output_path), fourcc, FPS, (width, height))
+                    
                 out.write(frame)
                 
                 # Precise sleep to maintain 1.0x speed
@@ -126,7 +135,8 @@ class ScreenRecorder:
                 sleep_time = max(0, frame_duration - elapsed)
                 time.sleep(sleep_time)
         finally:
-            out.release()
+            if out is not None:
+                out.release()
 
     def _record_audio_loop(self, output_path: Path) -> None:
         """Audio recording loop."""
@@ -310,30 +320,38 @@ class RecorderApp(ctk.CTk):
         self.option_format.configure(state="disabled")
         self.check_audio.configure(state="disabled")
         
-        self.label_status.configure(text="Starting in 3...")
-        self.update()
-        
-        for i in range(2, 0, -1):
-            time.sleep(1)
-            self.label_status.configure(text=f"Starting in {i}...")
-            self.update()
-        
-        time.sleep(1)
-        self.recorder.start(video_format=self.format_var.get(), record_audio=self.audio_var.get())
-        self.start_time = time.time()
-        
-        self.btn_stop.configure(state="normal")
-        self.label_status.configure(text="Recording...")
-        self._update_timer()
+        self.countdown = 3
+        self._countdown_step()
+
+    def _countdown_step(self) -> None:
+        """Non-blocking countdown before the recording starts."""
+        if self.countdown > 0:
+            self.label_status.configure(text=f"Starting in {self.countdown}...")
+            self.countdown -= 1
+            self.after(1000, self._countdown_step) # Use .after() instead of time.sleep()
+        else:
+            self.label_status.configure(text="Recording...")
+            self.recorder.start(video_format=self.format_var.get(), record_audio=self.audio_var.get())
+            self.start_time = time.time()
+            self.btn_stop.configure(state="normal")
+            self._update_timer()
 
     def _on_stop(self) -> None:
         """Handle stop button click."""
         self.label_status.configure(text="Saving and merging... please wait.")
+        self.btn_stop.configure(state="disabled")
         self.update()
         
+        # Run saving logic in a background thread to prevent GUI freeze
+        threading.Thread(target=self._stop_recording_thread, daemon=True).start()
+
+    def _stop_recording_thread(self) -> None:
+        """Run recorder stop functionality in the background."""
         self.recorder.stop()
-        
-        self.btn_stop.configure(state="disabled")
+        self.after(0, self._on_stop_finished)
+
+    def _on_stop_finished(self) -> None:
+        """Re-enable elements once merging completely finishes."""
         self.btn_start.configure(state="normal")
         self.btn_browse.configure(state="normal")
         self.option_format.configure(state="normal")
@@ -351,3 +369,7 @@ class RecorderApp(ctk.CTk):
             self.label_timer.configure(text=f"{hours:02}:{minutes:02}:{seconds:02}")
             self.after(1000, self._update_timer)
 
+
+if __name__ == "__main__":
+    app = RecorderApp()
+    app.mainloop()
